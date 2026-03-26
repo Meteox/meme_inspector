@@ -1,17 +1,25 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
+import os
 import sqlite3
-import re
 import asyncio
 import random
 import aiohttp
+import discord
+from google import genai
+from datetime import datetime
+from discord.ext import commands
+from discord import app_commands
+from dotenv import load_dotenv
 
 # -------------------------
-# CONFIG
+# 1. SETUP & CONFIG
 # -------------------------
-TOKEN = "deine"
-GIPHY_API_KEY = "mama"
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+GIPHY_API_KEY = os.getenv("GIPHY_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_KEY")
+
+MODEL_PRIMARY = 'gemini-3.1-flash-lite-preview'
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 class MemeBot(commands.Bot):
     def __init__(self):
@@ -23,302 +31,251 @@ class MemeBot(commands.Bot):
 
     async def setup_hook(self):
         await self.tree.sync()
-        print(f"✅ Slash-Commands synchronisiert!")
+        log_system("Slash-Commands synchronisiert.")
 
 bot = MemeBot()
 
 # -------------------------
-# HELPER FUNCTIONS
+# 2. LOGGING & API CHECKS
 # -------------------------
+def log_system(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚙️  SYSTEM: {msg}")
 
-MEDIA_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm")
+def log_cmd(user, cmd_name, channel):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚔 CMD: {user} nutzte /{cmd_name} in #{channel}")
 
-def is_media(message):
-    """ Prüft auf echte Bilder, Videos, GIFs oder Sticker. """
-    # 1. Dateianhänge prüfen (Bilder/Videos)
-    if any(attachment.filename.lower().endswith(MEDIA_EXTENSIONS) for attachment in message.attachments):
-        return True
-    # 2. Embeds prüfen (GIF-Links, Tenor, Giphy)
-    if any(embed.image or embed.video or (embed.type in ['image', 'video', 'gifv']) for embed in message.embeds):
-        return True
-    # 3. Sticker prüfen (NEU: Sticker zählen jetzt als Meme)
-    if len(message.stickers) > 0:
-        return True
-    return False
+async def check_apis():
+    """Prüft beim Start, ob alle Verbindungen stehen."""
+    log_system("Starte API-Integritätstest...")
+    
+    # 1. Giphy Check
+    giphy_ok = False
+    async with aiohttp.ClientSession() as session:
+        url = f"https://api.giphy.com/v1/gifs/search?api_key={GIPHY_API_KEY}&q=test&limit=1"
+        async with session.get(url) as r:
+            if r.status == 200:
+                log_system("✅ Giphy API: Verbindung erfolgreich.")
+                giphy_ok = True
+            else:
+                log_system("❌ Giphy API: Key ungültig oder Dienst offline!")
 
-async def get_dynamic_gif(ratio_val):
-    """ Sucht ein Giphy GIF basierend auf der Meme:Text Ratio """
-    perfect_keywords = ["party", "dancing", "celebration", "fireworks", "king", "victory", "hype"]
-    good_keywords = ["thumbs up", "nice", "clapping", "happy", "smiling", "cool", "nod"]
-    neutral_keywords = ["shrug", "okay", "not bad", "thinking", "staring"]
-    bad_keywords = ["yawning", "boring", "reading", "sleeping", "waiting", "bored"]
-    outrageous_keywords = ["facepalm", "angry", "screaming", "disappointed", "stop talking", "ugh"]
+    # 2. Gemini Check
+    gemini_ok = False
+    try:
+        response = await asyncio.to_thread(client.models.generate_content, model=MODEL_PRIMARY, contents="Hi")
+        if response.text:
+            log_system("✅ Gemini AI: Verbindung erfolgreich.")
+            gemini_ok = True
+    except Exception as e:
+        log_system(f"❌ Gemini AI: Fehler ({e})")
 
-    if ratio_val >= 1.5:
-        search = random.choice(perfect_keywords)
-    elif ratio_val >= 1.2:
-        search = random.choice(good_keywords)
-    elif ratio_val >= 0.8:
-        search = random.choice(neutral_keywords)
-    elif ratio_val >= 0.5:
-        search = random.choice(bad_keywords)
-    else:
-        search = random.choice(outrageous_keywords)
+    return giphy_ok and gemini_ok
 
-    url = f"https://api.giphy.com/v1/gifs/search?api_key={GIPHY_API_KEY}&q={search}&limit=20&rating=g"
+# -------------------------
+# 3. HILFSFUNKTIONEN
+# -------------------------
+async def get_ai_response(prompt, fallback_text):
+    try:
+        response = await asyncio.to_thread(client.models.generate_content, model=MODEL_PRIMARY, contents=prompt)
+        return response.text[:1000]
+    except: return fallback_text
+
+async def get_dynamic_gif(ratio_val, context="meme"):
+    search = "cool thumbs up"
+    if context == "meme":
+        if ratio_val >= 1.2: search = "meme lord praise"
+        elif ratio_val >= 0.7: search = "approve nod"
+        elif ratio_val >= 0.4: search = "shrug judge"
+        else: search = "disappointed facepalm"
+    
+    url = f"https://api.giphy.com/v1/gifs/search?api_key={GIPHY_API_KEY}&q={search}&limit=10&rating=g"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    gifs = data.get('data', [])
-                    if gifs:
-                        return random.choice(gifs)['url']
+            async with session.get(url) as r:
+                data = await r.json()
+                gifs = data.get('data', [])
+                if gifs: return random.choice(gifs)['images']['original']['url']
     except: pass
     return "https://media.giphy.com/media/3o7TKSjPQC1Id6S1iM/giphy.gif"
 
+def is_media(msg):
+    ext = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm")
+    if any(a.filename.lower().endswith(ext) for a in msg.attachments): return True
+    if any(e.image or e.video or (e.type in ['image', 'video', 'gifv']) for e in msg.embeds): return True
+    return bool(msg.stickers)
+
 # -------------------------
-# SLASH COMMANDS
+# 4. BEFEHLE (KOMPLETTES SET)
 # -------------------------
 
-@bot.tree.command(name="ratio", description="Checkt die letzten 100 Nachrichten (Meme:Text Ratio)")
-async def ratio(interaction: discord.Interaction):
-    await interaction.response.defer()
-    
-    txt_count, meme_count = 0, 0
-    async for msg in interaction.channel.history(limit=100):
-        if not msg.author.bot:
-            if is_media(msg): 
-                meme_count += 1
-            elif msg.content and msg.content.strip(): 
-                # Alles was kein Media ist, aber Text/Emojis enthält, zählt als Text
-                txt_count += 1
-                
-    if txt_count + meme_count == 0:
-        return await interaction.followup.send("Keine Nachrichten zum Analysieren gefunden.")
-    
-    ratio_val = meme_count / (txt_count if txt_count > 0 else 1)
-    gif_url = await get_dynamic_gif(ratio_val)
-    
-    if ratio_val >= 1.5: status = "💎 **PERFECT** - Meme-Paradies!"
-    elif ratio_val >= 1.2: status = "✅ **GOOD** - Stabile Quote."
-    elif ratio_val >= 0.8: status = "⚖️ **NEUTRAL** - Ausgeglichen."
-    elif ratio_val >= 0.5: status = "⚠️ **BAD** - Zu viel Gelaber."
-    else: status = "🚫 **OUTRAGEOUS** - Text-Wüste!"
-
-    await interaction.followup.send(
-        f"🕒 **Quick-Check (Letzte 100)**\n"
-        f"🖼️ Memes: `{meme_count}` | 📝 Text: `{txt_count}`\n"
-        f"📊 Ratio: `{ratio_val:.2f}` Memes pro Text.\n"
-        f"Urteil: {status}\n\n"
-        f"{gif_url}"
-    )
-
-@bot.tree.command(name="ratio_user", description="🚔 Einzel-Inspektion eines Verdächtigen")
-@app_commands.describe(user="Der User (leer lassen für dich selbst)")
-async def ratio_user(interaction: discord.Interaction, user: discord.Member = None):
-    await interaction.response.defer()
+@bot.tree.command(name="inspect_user", description="🚔 Analyse der Ratio im aktuellen Kanal")
+async def inspect_user(interaction: discord.Interaction, user: discord.Member = None):
+    await interaction.response.defer() # <--- IMMER ZUERST
+    log_cmd(interaction.user, "inspect_user", interaction.channel.name)
     target = user or interaction.user
+    is_meme_channel = "meme" in interaction.channel.name.lower()
     
     with sqlite3.connect("ratio.db") as conn:
-        c = conn.cursor()
-        c.execute("SELECT text_count, meme_count FROM stats WHERE guild_id=? AND channel_id=? AND user_id=?", 
-                  (interaction.guild_id, interaction.channel_id, target.id))
-        res = c.fetchone()
+        res = conn.execute("SELECT text_count, meme_count FROM stats WHERE guild_id=? AND channel_id=? AND user_id=?", 
+                           (interaction.guild_id, interaction.channel_id, target.id)).fetchone()
     
-    if not res or (res[0] == 0 and res[1] == 0):
-        return await interaction.followup.send(f"🔍 Keine Akten zu {target.display_name} gefunden.")
+    txt, meme = (res[0] if res else 0, res[1] if res else 0)
+    ratio = meme / (txt if txt > 0 else 1)
+    gif_url = await get_dynamic_gif(ratio, context="meme" if is_meme_channel else "chill")
+    prompt = f"Du bist der Meme Inspector. Ratio {ratio:.2f} in {'einem Meme-Channel' if is_meme_channel else 'einem normalen Channel'}. Max 15 Wörter."
+    ai_comment = await get_ai_response(prompt, "Daten gesichert.")
     
-    txt, meme = res
-    ratio_val = meme / (txt if txt > 0 else 1)
-    gif_url = await get_dynamic_gif(ratio_val)
-    
-    if ratio_val >= 1.5: status = "💎 **PERFECT**"
-    elif ratio_val >= 1.2: status = "✅ **GOOD**"
-    elif ratio_val >= 0.8: status = "⚖️ **NEUTRAL**"
-    elif ratio_val >= 0.5: status = "⚠️ **BAD**"
-    else: status = "🚫 **OUTRAGEOUS**"
-
-    await interaction.followup.send(
-        f"🚔 **Meme-Inspektion bei {target.mention}**\n"
-        f"🖼️ Memes: `{meme}` | 📝 Texte: `{txt}`\n"
-        f"📊 Ratio: `{ratio_val:.2f}` Memes pro Text.\n"
-        f"Urteil: {status}\n\n"
-        f"{gif_url}"
-    )
-
-@bot.tree.command(name="ratio_top", description="🏆 Das Meme-Leaderboard dieses Kanals")
-async def ratio_top(interaction: discord.Interaction):
-    await interaction.response.defer()
-    with sqlite3.connect("ratio.db") as conn:
-        c = conn.cursor()
-        c.execute("""SELECT user_id, text_count, meme_count FROM stats 
-                     WHERE guild_id=? AND channel_id=? AND (text_count + meme_count) > 5 
-                     ORDER BY (CAST(meme_count AS FLOAT) / CASE WHEN text_count = 0 THEN 1 ELSE text_count END) DESC LIMIT 5""", 
-                  (interaction.guild_id, interaction.channel_id))
-        rows = c.fetchall()
-    
-    if not rows: return await interaction.followup.send("Nicht genug Daten vorhanden.")
-    
-    lines = [f"{['🥇','🥈','🥉','🏅','🏅'][i]} <@{uid}>: `{meme/(txt if txt>0 else 1):.2f}` Ratio" for i, (uid, txt, meme) in enumerate(rows)]
-    embed = discord.Embed(title=f"🏆 Meme-Leaderboard: #{interaction.channel.name}", description="\n".join(lines), color=discord.Color.gold())
+    embed = discord.Embed(title=f"🚔 Urteil: {target.display_name}", color=discord.Color.blue())
+    embed.description = f"Kanal: **#{interaction.channel.name}**\n📊 Ratio: `{ratio:.2f}` (🖼️ {meme} / 📝 {txt})"
+    embed.set_image(url=gif_url)
+    embed.add_field(name="Inspector sagt:", value=ai_comment)
     await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="ratio_all", description="Gesamt-Statistik des Kanals")
-async def ratio_all(interaction: discord.Interaction):
+@bot.tree.command(name="meme", description="🎲 Postet ein zufälliges Meme-GIF")
+async def meme(interaction: discord.Interaction, suchbegriff: str = "funny meme"):
+    await interaction.response.defer() # <--- ZUERST
+    log_cmd(interaction.user, f"meme ({suchbegriff})", interaction.channel.name)
+    await interaction.response.defer()
+    url = f"https://api.giphy.com/v1/gifs/search?api_key={GIPHY_API_KEY}&q={suchbegriff}&limit=10&rating=g"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as r:
+            data = await r.json()
+            gifs = data.get('data', [])
+            gif = random.choice(gifs)['images']['original']['url'] if gifs else None
+    if gif: await interaction.followup.send(gif)
+    else: await interaction.followup.send("Nichts gefunden.")
+
+@bot.tree.command(name="channel_top_stats", description="📊 Top User des Kanals")
+async def channel_top_stats(interaction: discord.Interaction):
+    await interaction.response.defer() # <--- ZUERST
+    log_cmd(interaction.user, "channel_top_stats", interaction.channel.name)
+    await interaction.response.defer()
     with sqlite3.connect("ratio.db") as conn:
-        c = conn.cursor()
-        c.execute("SELECT SUM(text_count), SUM(meme_count) FROM stats WHERE guild_id=? AND channel_id=?", 
-                  (interaction.guild_id, interaction.channel_id))
-        res = c.fetchone()
-    
-    txt, meme = (res[0] or 0, res[1] or 0)
-    if txt + meme == 0: return await interaction.response.send_message("Keine Daten.")
-    
-    ratio_val = meme / (txt if txt > 0 else 1)
-    await interaction.response.send_message(f"🌍 **Gesamt-Statistik: #{interaction.channel.name}**\n🖼️ Memes: `{meme}` | 📝 Texte: `{txt}`\n📊 Ratio: `{ratio_val:.2f}`")
+        res = conn.execute("SELECT user_id, text_count, meme_count FROM stats WHERE guild_id=? AND channel_id=? ORDER BY meme_count DESC LIMIT 10", 
+                           (interaction.guild_id, interaction.channel_id)).fetchall()
+    embed = discord.Embed(title=f"📊 Kanal-Top 10: #{interaction.channel.name}", color=discord.Color.green())
+    for i, (uid, t, m) in enumerate(res, 1):
+        u = interaction.guild.get_member(uid)
+        embed.add_field(name=f"{i}. {u.display_name if u else uid}", value=f"🖼️ {m} | 📝 {t}", inline=False)
+    await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="ratio_refresh", description="Datenbank komplett neu scannen")
-async def ratio_refresh(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+@bot.tree.command(name="server_top_stats", description="🏆 Server-Meme-Ranking")
+async def server_top_stats(interaction: discord.Interaction):
+    await interaction.response.defer() # <--- ZUERST
+    log_cmd(interaction.user, "server_top_stats", interaction.channel.name)
+    await interaction.response.defer()
     with sqlite3.connect("ratio.db") as conn:
-        conn.execute("DELETE FROM stats WHERE guild_id=? AND channel_id=?", (interaction.guild_id, interaction.channel_id))
-    
-    count = 0
-    async for msg in interaction.channel.history(limit=None):
-        if not msg.author.bot:
-            m_status = is_media(msg)
-            if m_status or (msg.content and msg.content.strip()):
-                with sqlite3.connect("ratio.db") as conn:
-                    c = conn.cursor()
-                    c.execute("INSERT OR IGNORE INTO stats VALUES (?, ?, ?, 0, 0)", (interaction.guild_id, interaction.channel_id, msg.author.id))
-                    f = "meme_count" if m_status else "text_count"
-                    c.execute(f"UPDATE stats SET {f} = {f} + 1 WHERE guild_id=? AND channel_id=? AND user_id=?", (interaction.guild_id, interaction.channel_id, msg.author.id))
-                    conn.commit()
-                count += 1
-    await interaction.followup.send(f"✅ Scan von `{count}` Nachrichten abgeschlossen!")
+        res = conn.execute("SELECT user_id, SUM(text_count), SUM(meme_count) FROM stats WHERE guild_id=? GROUP BY user_id ORDER BY SUM(meme_count) DESC LIMIT 10", 
+                           (interaction.guild_id,)).fetchall()
+    embed = discord.Embed(title="🏆 Server Meme-Könige", color=discord.Color.gold())
+    for i, (uid, t, m) in enumerate(res, 1):
+        u = interaction.guild.get_member(uid)
+        embed.add_field(name=f"{i}. {u.display_name if u else uid}", value=f"🖼️ {m} gesamt", inline=False)
+    await interaction.followup.send(embed=embed)
 
-# -------------------------
-# GLOBAL SERVER COMMANDS
-# -------------------------
-
-@bot.tree.command(name="ratio_server_scan", description="🚔 Große Inspektion: Scannt den gesamten Server (Alle Kanäle)")
-async def ratio_server_scan(interaction: discord.Interaction):
-    """Scannt den kompletten Nachrichtenverlauf aller Kanäle und füllt die Datenbank"""
+@bot.tree.command(name="sys_inspect_deep_scan", description="⚙️ SYSTEM: Kompletter Scan")
+async def sys_inspect_deep_scan(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True) # <--- ZUERST (zeigt "Bot denkt nach...")
+    log_cmd(interaction.user, "sys_inspect_deep_scan", "ALL")
+    if not interaction.user.guild_permissions.administrator: return
     await interaction.response.defer(thinking=True)
-    
-    total_msgs = 0
-    channels_scanned = 0
-
-    for channel in interaction.guild.text_channels:
-        perms = channel.permissions_for(interaction.guild.me)
-        if not perms.read_message_history or not perms.read_messages:
-            continue
-        
-        channels_scanned += 1
-        async for msg in channel.history(limit=None): # limit=None für ALLES
+    total = 0
+    for ch in interaction.guild.text_channels:
+        perms = ch.permissions_for(interaction.guild.me)
+        if not perms.read_message_history or not perms.view_channel: continue
+        log_system(f"Scanne #{ch.name}...")
+        async for msg in ch.history(limit=None):
             if msg.author.bot: continue
-            
-            m_status = is_media(msg)
-            if m_status or (msg.content and msg.content.strip()):
-                with sqlite3.connect("ratio.db") as conn:
-                    c = conn.cursor()
-                    c.execute("INSERT OR IGNORE INTO stats VALUES (?, ?, ?, 0, 0)", 
-                              (interaction.guild.id, channel.id, msg.author.id))
-                    f = "meme_count" if m_status else "text_count"
-                    c.execute(f"UPDATE stats SET {f} = {f} + 1 WHERE guild_id=? AND channel_id=? AND user_id=?", 
-                              (interaction.guild.id, channel.id, msg.author.id))
-                    conn.commit()
-                total_msgs += 1
-                
-    await interaction.followup.send(f"✅ **Inspektion abgeschlossen!**\nScanned Kanäle: `{channels_scanned}`\nErfasste Nachrichten: `{total_msgs}`\nDie globale Datenbank ist nun aktuell.")
+            m = is_media(msg)
+            with sqlite3.connect("ratio.db") as conn:
+                conn.execute("INSERT OR IGNORE INTO stats VALUES (?, ?, ?, 0, 0)", (interaction.guild.id, ch.id, msg.author.id))
+                f = "meme_count" if m else "text_count"
+                conn.execute(f"UPDATE stats SET {f} = {f} + 1 WHERE guild_id=? AND channel_id=? AND user_id=?", (interaction.guild.id, ch.id, msg.author.id))
+            total += 1
+            if total % 1000 == 0: log_system(f"Fortschritt: {total} Nachrichten...")
+    await interaction.followup.send(f"✅ Scan beendet: `{total}` Nachrichten.")
 
-@bot.tree.command(name="ratio_server_stats", description="📊 Gesamt-Statistik des kompletten Servers")
-async def ratio_server_stats(interaction: discord.Interaction):
-    """Gibt die Summe aller Texte und Memes über alle Kanäle aus"""
+@bot.tree.command(name="wannamaranthyr", description="⏳ Zeit seit DnD")
+async def wannamaranthyr(interaction: discord.Interaction):
+    await interaction.response.defer() # <--- ZUERST
+    log_cmd(interaction.user, "wannamaranthyr", interaction.channel.name)
+    await interaction.response.defer()
     with sqlite3.connect("ratio.db") as conn:
-        c = conn.cursor()
-        c.execute("SELECT SUM(text_count), SUM(meme_count) FROM stats WHERE guild_id=?", (interaction.guild_id,))
-        res = c.fetchone()
-    
-    txt, meme = (res[0] or 0, res[1] or 0)
-    if txt + meme == 0:
-        return await interaction.response.send_message("Keine Server-Daten vorhanden. Nutze erst `/ratio_server_scan`.")
-    
-    ratio_val = meme / (txt if txt > 0 else 1)
-    
-    embed = discord.Embed(title=f"🌍 Globale Server-Statistik: {interaction.guild.name}", color=discord.Color.blue())
-    embed.add_field(name="📝 Gesamt Texte", value=f"`{txt}`", inline=True)
-    embed.add_field(name="🖼️ Gesamt Memes", value=f"`{meme}`", inline=True)
-    embed.add_field(name="📊 Server-Ratio", value=f"`{ratio_val:.2f}` Memes/Text", inline=False)
-    await interaction.response.send_message(embed=embed)
+        res = conn.execute("SELECT last_session FROM dnd_stats WHERE guild_id=?", (interaction.guild_id,)).fetchone()
+    if not res: return await interaction.followup.send("Datum fehlt.")
+    delta = (datetime.now() - datetime.strptime(res[0], "%d.%m.%Y")).days
+    gif = await get_dynamic_gif(0.1 if delta > 21 else 1.5)
+    await interaction.followup.send(embed=discord.Embed(title="🕵️‍♂️ DnD Timer", description=f"Tag {delta} ohne Amaranthyr...").set_image(url=gif))
 
-@bot.tree.command(name="ratio_server_user", description="👤 Globale Statistik eines Users über alle Kanäle")
-@app_commands.describe(user="Der User (leer lassen für dich selbst)")
-async def ratio_server_user(interaction: discord.Interaction, user: discord.Member = None):
-    """Summiert die Nachrichten eines Users aus allen Kanälen der Datenbank"""
-    target = user or interaction.user
-    with sqlite3.connect("ratio.db") as conn:
-        c = conn.cursor()
-        c.execute("SELECT SUM(text_count), SUM(meme_count) FROM stats WHERE guild_id=? AND user_id=?", 
-                  (interaction.guild_id, target.id))
-        res = c.fetchone()
-    
-    txt, meme = (res[0] or 0, res[1] or 0)
-    total = txt + meme
-    if total == 0:
-        return await interaction.response.send_message(f"Keine globalen Daten für {target.display_name} gefunden.")
+@bot.tree.command(name="dnd_set_session", description="📅 Datum setzen")
+async def dnd_set_session(interaction: discord.Interaction, datum: str):
+    log_cmd(interaction.user, "dnd_set_session", interaction.channel.name)
+    try:
+        datetime.strptime(datum, "%d.%m.%Y")
+        with sqlite3.connect("ratio.db") as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS dnd_stats (guild_id INTEGER PRIMARY KEY, last_session TEXT)")
+            conn.execute("INSERT OR REPLACE INTO dnd_stats VALUES (?, ?)", (interaction.guild_id, datum))
+        await interaction.response.send_message("✅ Datum gespeichert.")
+    except: await interaction.response.send_message("❌ Format: DD.MM.YYYY", ephemeral=True)
 
-    ratio_val = meme / (txt if txt > 0 else 1)
-    await interaction.response.send_message(
-        f"🚔 **Globale Akte: {target.mention}**\n"
-        f"Gesamt-Nachrichten: `{total}`\n"
-        f"Davon Memes: `{meme}` | Texte: `{txt}`\n"
-        f"Globale Ratio: `{ratio_val:.2f}`"
-    )
+@bot.tree.command(name="cleanup", description="🧹 Bot-Nachrichten löschen")
+async def cleanup(interaction: discord.Interaction, anzahl: int = 5):
+    log_cmd(interaction.user, "cleanup", interaction.channel.name)
+    await interaction.response.defer(ephemeral=True)
+    deleted = 0
+    async for msg in interaction.channel.history(limit=50):
+        if deleted >= anzahl: break
+        if msg.author == bot.user:
+            await msg.delete(); deleted += 1
+    await interaction.followup.send(f"✅ {deleted} gelöscht.")
 
-@bot.tree.command(name="ratio_server_top", description="🏆 Top 10 User des Servers (nach Gesamt-Nachrichten)")
-async def ratio_server_top(interaction: discord.Interaction):
-    """Ranking der aktivsten User basierend auf der Summe aller Nachrichten"""
-    with sqlite3.connect("ratio.db") as conn:
-        c = conn.cursor()
-        # Summiert Texte + Memes pro User über alle Kanäle des Servers
-        c.execute("""SELECT user_id, SUM(text_count + meme_count) as total 
-                     FROM stats WHERE guild_id=? 
-                     GROUP BY user_id 
-                     ORDER BY total DESC LIMIT 10""", (interaction.guild_id,))
-        rows = c.fetchall()
-    
-    if not rows:
-        return await interaction.response.send_message("Keine Daten für ein Top-Ranking gefunden.")
-    
-    lines = [f"**#{i+1}** <@{uid}>: `{total}` Nachrichten" for i, (uid, total) in enumerate(rows)]
-    embed = discord.Embed(title=f"🏆 Top 10 aktivste User: {interaction.guild.name}", 
-                          description="\n".join(lines), color=discord.Color.gold())
-    await interaction.response.send_message(embed=embed)
+@bot.tree.command(name="ask_inspector", description="🤖 Frage an die KI")
+async def ask_inspector(interaction: discord.Interaction, frage: str):
+    await interaction.response.defer() # <--- ZUERST
+    log_cmd(interaction.user, "ask_inspector", interaction.channel.name)
+    await interaction.response.defer()
+    ai_res = await get_ai_response(f"Antworte kurz: {frage}", "Kein Kommentar.")
+    embed = discord.Embed(title="🔍 KI-Anfrage", color=discord.Color.gold())
+    embed.add_field(name="❓ Frage", value=f"*{frage}*", inline=False)
+    embed.add_field(name="🚔 Urteil", value=ai_res, inline=False)
+    await interaction.followup.send(embed=embed)
+
 # -------------------------
-# EVENTS
+# 5. STARTUP & EVENTS
 # -------------------------
-
 @bot.event
 async def on_ready():
+    log_system(f"Anmeldung erfolgreich als {bot.user}")
+    
+    # Datenbank Setup
     with sqlite3.connect("ratio.db") as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS stats (guild_id INTEGER, channel_id INTEGER, user_id INTEGER, text_count INTEGER DEFAULT 0, meme_count INTEGER DEFAULT 0, PRIMARY KEY (guild_id, channel_id, user_id))")
-    await bot.change_presence(activity=discord.Game(name="/ratio | 🚔 Meme Inspector"))
-    print(f"🚀 {bot.user} ist im Einsatz!")
+        conn.execute("CREATE TABLE IF NOT EXISTS dnd_stats (guild_id INTEGER PRIMARY KEY, last_session TEXT)")
+    log_system("Datenbank-Check: OK.")
+
+    # API Check
+    api_status = await check_apis()
+    if api_status:
+        log_system("Gesamtsystem: BEREIT FÜR DEN DIENST. 🚔")
+    else:
+        log_system("⚠️ WARNUNG: Einige APIs sind nicht bereit. Funktionen könnten eingeschränkt sein.")
+
+    await bot.change_presence(activity=discord.Game(name="/inspect_user 🚔"))
 
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild: return
-    m_status = is_media(message)
-    # Wenn es kein Bild/Video/GIF ist, aber Inhalt hat -> Text-Counter hoch
-    if m_status or (message.content and message.content.strip()):
-        with sqlite3.connect("ratio.db") as conn:
-            c = conn.cursor()
-            c.execute("INSERT OR IGNORE INTO stats (guild_id, channel_id, user_id) VALUES (?, ?, ?)", (message.guild.id, message.channel.id, message.author.id))
-            f = "meme_count" if m_status else "text_count"
-            c.execute(f"UPDATE stats SET {f} = {f} + 1 WHERE guild_id=? AND channel_id=? AND user_id=?", (message.guild.id, message.channel.id, message.author.id))
-            conn.commit()
+    m = is_media(message)
+    with sqlite3.connect("ratio.db") as conn:
+        conn.execute("INSERT OR IGNORE INTO stats VALUES (?, ?, ?, 0, 0)", (message.guild.id, message.channel.id, message.author.id))
+        f = "meme_count" if m else "text_count"
+        conn.execute(f"UPDATE stats SET {f} = {f} + 1 WHERE guild_id=? AND channel_id=? AND user_id=?", (message.guild.id, message.channel.id, message.author.id))
+
+    if not m and "meme" in message.channel.name.lower() and len(message.content) > 60 and random.random() < 0.1:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🤖 AUTO: VETO in #{message.channel.name}")
+        ai_msg = await get_ai_response("Rüge den User frech für Text im Meme-Channel.", "Bild her!")
+        await message.reply(f"🚔 **Inspector:** {ai_msg}")
+
     await bot.process_commands(message)
 
 bot.run(TOKEN)
